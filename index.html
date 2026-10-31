@@ -234,7 +234,9 @@ selCh.onchange = () => { S.chan = +selCh.value; persist(); };
 
 function sendCC(cc, v) {
   if (!S.out) return;
-  try { S.out.send([0xB0 | (S.chan - 1), cc & 127, v & 127]); } catch (e) {}
+  const msg = [0xB0 | (S.chan - 1), cc & 127, v & 127];
+  try { S.out.send(msg); } catch (e) {}
+  V.raw(msg);
 }
 function queueCC(cc, v) { S.pending.set(cc, v); }
 function flushCC() {
@@ -291,6 +293,7 @@ function onMidi(e) {
   if (type === 0x90 && d[2] > 0) V.noteOn(d[1], d[2], ch);
   else if (type === 0x80 || (type === 0x90 && d[2] === 0)) V.noteOff(d[1], ch);
   else if (type === 0xB0) {
+    V.raw([st, d[1], d[2]]);
     if (ch !== S.chan) return;
     const cc = d[1], v = d[2];
     if (cc >= CC_BASE && cc < CC_BASE + 22) {
@@ -299,6 +302,7 @@ function onMidi(e) {
     } else if (cc === CC_X && !xyTouch) { S.x = v; renderXY(); }
     else if (cc === CC_Y && !xyTouch) { S.y = v; renderXY(); }
   } else if (type === 0xC0) {
+    V.raw([st, d[1]]);
     setScene(d[1] % SCENES.length);
   }
 }
@@ -485,6 +489,7 @@ const V = {
     if (!echo) {
       this.notes.set(ch + ":" + n, { n, v, ch, t0: t, rel: null });
       this.log.unshift({ n, v, ch, t }); if (this.log.length > 9) this.log.pop();
+      this.raw([0x90 | ((ch - 1) & 15), n & 127, vel & 127]);
       // delay send -> visual echoes
       const reps = Math.floor(pv(13) * 4.99);
       const dt = this.bpm ? 30 / this.bpm : 0.25;   // eighth note
@@ -495,7 +500,9 @@ const V = {
   noteOff(n, ch) {
     const k = ch + ":" + n, o = this.notes.get(k);
     if (o && o.rel === null) o.rel = this.now;
+    this.raw([0x80 | ((ch - 1) & 15), n & 127, 0]);
   },
+  raw(b) { const sc = SCENES[cur]; if (sc && sc.onRaw) sc.onRaw(b); },
   level(o) {
     const t = this.now;
     let a = clamp((t - o.t0) / attackTime(), 0, 1);
@@ -525,128 +532,121 @@ const V = {
 
 // pitch -> position helpers
 const pitchX = n => 0.06 + ((n - 24) / 72) * 0.88;     // C1..C7 across
-const gridCell = n => ({ c: n % 16, r: 15 - ((n >> 3) % 16) });
+const pad2 = v => String(v).padStart(2, "0");
+const pad3 = v => String(v).padStart(3, "0");
+const hex2 = b => (b & 255).toString(16).toUpperCase().padStart(2, "0");
+function describe(b) {
+  const type = b[0] & 0xF0, ch = (b[0] & 15) + 1;
+  if (type === 0x90) return `NOTE ON · ${noteName(b[1])} · VEL ${pad3(b[2])} · CH${pad2(ch)}`;
+  if (type === 0x80) return `NOTE OFF · ${noteName(b[1])} · CH${pad2(ch)}`;
+  if (type === 0xB0) return `CC ${pad3(b[1])} = ${pad3(b[2])} · CH${pad2(ch)}`;
+  if (type === 0xC0) return `PROGRAM ${pad3(b[1])} · CH${pad2(ch)}`;
+  return "DATA";
+}
+// shared bottom readout for the dark scenes
+function readout(fg) {
+  ctx.font = "600 11px 'Red Hat Mono', monospace"; ctx.textBaseline = "top"; ctx.fillStyle = fg;
+  const e = V.log[0];
+  ctx.fillText(e ? `${noteName(e.n)} / ${pad3(Math.round(e.v * 127))} / CH${e.ch}` : "WAITING FOR SIGNAL", 24, H - 60);
+  ctx.fillText(`LP ${pad3(S.vals[1])}  RES ${pad3(S.vals[2])}  FOLD ${String(S.vals[11] - 64).padStart(3, " ")}  XY ${S.x}.${S.y}  ${V.bpm ? Math.round(V.bpm) + " BPM" : "NO CLOCK"}`, 24, H - 42);
+  ctx.fillStyle = V.now - V.beatT < 0.1 ? RED : fg;
+  ctx.fillRect(W - 40, H - 58, 14, 14);
+}
 
 // ---------------------------------------------------------------------
-// SCENE 01 — GRID (Wipeout poster: paper, ink hairlines, red events)
+// SCENE 01 — EVENTS (paper: dominant note + voices, functional XY pad)
 // ---------------------------------------------------------------------
-const sceneGrid = {
-  name: "GRID",
-  cells: new Float32Array(256), hot: new Float32Array(256), rings: [], last: -1, lastT: -10,
-  reset() { this.rings = []; },
-  spawn(e) {
-    const { c, r } = gridCell(e.n), k = r * 16 + c;
-    this.cells[k] = Math.max(this.cells[k], e.v);
-    if (!e.echo) { this.hot[k] = 1; this.last = k; this.lastT = e.t; }
-    this.rings.push({ k, t: e.t, v: e.v, echo: e.echo });
+const sceneEvents = {
+  name: "EVENTS",
+  pad: null, drag: null,
+  reset() { if (this.drag !== null) { this.drag = null; xyTouch = false; } },
+  spawn() {},
+  pointer(type, e, x, y) {
+    if (type === "down") {
+      const p = this.pad;
+      if (!p || x < p.x || x > p.x + p.s || y < p.y || y > p.y + p.s) return false;
+      this.drag = e.pointerId; xyTouch = true; this.setXY(x, y); return true;
+    }
+    if (e.pointerId !== this.drag) return false;
+    if (type === "move") this.setXY(x, y);
+    else { this.drag = null; xyTouch = false; }
+    return true;
   },
-  draw(dt) {
-    const t = V.now;
+  setXY(x, y) {
+    const p = this.pad;
+    const nx = Math.round(clamp((x - p.x) / p.s, 0, 1) * 127);
+    const ny = Math.round(clamp(1 - (y - p.y) / p.s, 0, 1) * 127);
+    if (nx !== S.x) { S.x = nx; queueCC(CC_X, nx); }
+    if (ny !== S.y) { S.y = ny; queueCC(CC_Y, ny); }
+    renderXY(); markDirty();
+  },
+  draw() {
+    const t = V.now, m = 32, top = 84;
     ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H);
-    const nameH = Math.min(H * 0.14, W * 0.1);
-    const gy = 84;                                     // below the scene buttons
-    const S0 = Math.max(120, Math.min(H - gy - nameH - 70, W * 0.52));
-    const gx = Math.max(34, W * 0.04), cell = S0 / 16;
+    // XY pad on the right, square
+    const ps = Math.max(160, Math.min(H - top - m, W * 0.42));
+    const px = W - m - ps, py = top + Math.max(0, (H - top - m - ps) / 2);
+    this.pad = { x: px, y: py, s: ps };
+    const lw = px - m * 3;
 
-    // chassis: cut-corner double hairline
-    ctx.strokeStyle = INK; ctx.lineWidth = 1;
-    for (const o of [0, 6]) {
-      const x0 = gx - 10 - o, y0 = gy - 10 - o, x1 = gx + S0 + 10 + o, y1 = gy + S0 + 10 + o, cc = 14 + o;
-      ctx.beginPath();
-      ctx.moveTo(x0 + cc, y0); ctx.lineTo(x1, y0); ctx.lineTo(x1, y1 - cc); ctx.lineTo(x1 - cc, y1);
-      ctx.lineTo(x0, y1); ctx.lineTo(x0, y0 + cc); ctx.closePath(); ctx.stroke();
-    }
-
-    // held notes keep their LED lit with envelope level
-    const held = new Float32Array(256);
-    V.notes.forEach(o => { const { c, r } = gridCell(o.n); const k = r * 16 + c; held[k] = Math.max(held[k], V.level(o)); });
-
-    const decay = Math.exp(-dt / (0.08 + releaseTime() * 0.5));
-    const rad = cell * (0.28 + pv(1) * 0.08);   // LP cutoff opens the LEDs
-    for (let k = 0; k < 256; k++) {
-      this.cells[k] *= decay; this.hot[k] *= Math.exp(-dt / 0.12);
-      const x = gx + (k % 16 + 0.5) * cell, y = gy + ((k >> 4) + 0.5) * cell;
-      const lv = Math.max(this.cells[k], held[k]);
-      ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2);
-      if (lv > 0.02) {
-        ctx.fillStyle = this.hot[k] > 0.3 ? RED : `rgba(20,20,20,${clamp(lv * 1.2, 0.08, 1)})`;
-        ctx.fill();
-      } else {
-        ctx.strokeStyle = "rgba(20,20,20,.28)"; ctx.stroke();
-      }
-    }
-
-    // expanding red rings (resonance = sharper, thicker)
-    for (let i = this.rings.length - 1; i >= 0; i--) {
-      const g = this.rings[i], a = (t - g.t) / (0.5 + releaseTime() * 0.4);
-      if (a >= 1) { this.rings.splice(i, 1); continue; }
-      const x = gx + (g.k % 16 + 0.5) * cell, y = gy + ((g.k >> 4) + 0.5) * cell;
-      ctx.beginPath(); ctx.arc(x, y, rad + a * cell * (2 + g.v * 4), 0, Math.PI * 2);
-      ctx.strokeStyle = g.echo ? `rgba(20,20,20,${(1 - a) * 0.5})` : `rgba(255,58,31,${1 - a})`;
-      ctx.lineWidth = 1 + pv(2) * 3 * (1 - a); ctx.stroke();
-    }
-    ctx.lineWidth = 1;
-
-    // XY crosshair over the grid
-    const cx = gx + S.x / 127 * S0, cy = gy + (1 - S.y / 127) * S0;
-    ctx.strokeStyle = "rgba(20,20,20,.55)";
-    ctx.beginPath(); ctx.moveTo(gx, cy); ctx.lineTo(gx + S0, cy); ctx.moveTo(cx, gy); ctx.lineTo(cx, gy + S0); ctx.stroke();
-    xBox(cx, cy, 9);
-
-    // info column
-    const ix = gx + S0 + 48, iw = W - ix - 24;
-    if (iw > 160) {
-      let y = gy;
-      tag(ix, y, "01 EVENTS"); y += 30;
-      ctx.font = "600 13px 'Red Hat Mono', monospace"; ctx.textBaseline = "top";
-      V.log.forEach((e, k) => {
-        const age = t - e.t;
-        ctx.fillStyle = k === 0 && age < 0.15 ? RED : `rgba(20,20,20,${clamp(1 - k * 0.09, 0.25, 1)})`;
-        ctx.fillText(`${noteName(e.n).padEnd(4)} ${String(Math.round(e.v * 127)).padStart(3, "0")}  CH${String(e.ch).padStart(2, "0")}`, ix, y + k * 18);
-      });
-      // kinked route from last LED to the log
-      if (this.last >= 0 && t - this.lastT < 1.2) {
-        const a = 1 - (t - this.lastT) / 1.2;
-        const sx = gx + (this.last % 16 + 0.5) * cell, sy = gy + ((this.last >> 4) + 0.5) * cell;
-        const ex = ix - 8, ey = gy + 37;
-        const kx = gx + S0 + 22;
-        ctx.strokeStyle = `rgba(255,58,31,${a})`;
-        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(kx - Math.abs(ey - sy) * 0, sy);
-        ctx.lineTo(kx, sy); ctx.lineTo(kx + Math.min(14, Math.abs(ey - sy)), ey); ctx.lineTo(ex, ey); ctx.stroke();
-        ctx.fillStyle = `rgba(255,58,31,${a})`; ctx.fillRect(ex - 3, ey - 3, 6, 6);
-      }
-      y += 9 * 18 + 22;
-      tag(ix, y, "02 VOICE"); y += 32;
-      const gauges = [[1, "LP"], [2, "RES"], [3, "ATK"], [6, "REL"], [13, "DLY"], [14, "REV"]];
-      const gw = Math.min(iw - 60, 260);
-      gauges.forEach(([i, lbl], k) => {
-        const yy = y + k * 20;
-        ctx.fillStyle = INK; ctx.font = "600 11px 'Red Hat Mono', monospace";
-        ctx.fillText(lbl, ix, yy);
-        const bx = ix + 40, segs = 24;
-        for (let s = 0; s < segs; s++) {
-          const on = s / segs < pv(i);
-          ctx.fillStyle = on ? (S.touching.has(i) ? RED : INK) : "rgba(20,20,20,.14)";
-          ctx.fillRect(bx + s * (gw / segs), yy + 1, gw / segs - 2, 10);
-        }
-      });
-      y += 6 * 20 + 18;
-      // beat marker + bpm
-      const bAge = t - V.beatT;
-      ctx.fillStyle = bAge < 0.12 ? RED : INK;
-      ctx.fillRect(ix, y, 12, 12);
-      ctx.fillStyle = INK; ctx.font = "600 12px 'Red Hat Mono', monospace";
-      ctx.fillText(V.bpm ? `${Math.round(V.bpm)} BPM` : "NO CLOCK", ix + 22, y);
-      ctx.fillText(`BEAT ${String(V.beat % 1000).padStart(3, "0")}`, ix + 120, y);
-    }
-
-    // giant name across the bottom
-    ctx.fillStyle = INK; ctx.textBaseline = "alphabetic";
-    let fs = nameH * 0.9;
+    // 01 NOTE — last event, huge
+    let y = top;
+    tag(m, y, "01 NOTE"); y += 34;
+    const e = V.log[0], fresh = e && t - e.t < 0.15;
+    const fs = Math.max(40, Math.min((H - top) * 0.24, lw * 0.28));
+    ctx.textBaseline = "alphabetic"; ctx.fillStyle = fresh ? RED : INK;
     ctx.font = `${fs}px Boldonse, 'Arial Black', sans-serif`;
-    const tw = ctx.measureText("PLINKY//12").width;
-    if (tw > W - 48) { fs *= (W - 48) / tw; ctx.font = `${fs}px Boldonse, 'Arial Black', sans-serif`; }
-    ctx.fillText("PLINKY//12", 24, H - 18);
+    const label = e ? noteName(e.n) : "—";
+    const mt = ctx.measureText(label);                 // place by real glyph bounds (Boldonse metrics are unusual)
+    const asc = mt.actualBoundingBoxAscent || fs * 0.75, desc = mt.actualBoundingBoxDescent || 0;
+    ctx.fillText(label, m - 3, y + asc);
+    ctx.textBaseline = "top";
+    y += asc + desc + 26;
+    ctx.font = "700 15px 'Red Hat Mono', monospace"; ctx.fillStyle = INK;
+    ctx.fillText(e ? `VEL ${pad3(Math.round(e.v * 127))}   CH${pad2(e.ch)}   MIDI ${pad3(e.n)}` : "WAITING FOR SIGNAL", m, y);
+    y += 26;
+    ctx.fillStyle = "rgba(20,20,20,.12)"; ctx.fillRect(m, y, lw, 12);
+    if (e) { ctx.fillStyle = fresh ? RED : INK; ctx.fillRect(m, y, lw * e.v, 12); }
+    y += 40;
+
+    // 02 VOICES — held / releasing notes with live envelope level
+    const vs = [...V.notes.values()].sort((a, b) => b.t0 - a.t0).slice(0, 8);
+    tag(m, y, `02 VOICES  ${pad2(V.notes.size)}`); y += 32;
+    const rowH = clamp((H - y - m) / 8, 16, 40);
+    const fsz = Math.round(rowH * 0.5), bx = m + fsz * 3.2, bw = lw - (bx - m) - fsz * 2.6;
+    ctx.font = `700 ${fsz}px 'Red Hat Mono', monospace`;
+    for (let k = 0; k < 8; k++) {
+      const yy = y + k * rowH, o = vs[k], by = yy + rowH * 0.28, bh = rowH * 0.44;
+      ctx.fillStyle = "rgba(20,20,20,.1)"; ctx.fillRect(bx, by, bw, bh);
+      if (!o) continue;
+      const lv = V.level(o);
+      ctx.fillStyle = o.rel === null ? INK : "rgba(20,20,20,.4)";
+      ctx.fillText(noteName(o.n), m, yy + rowH * 0.25);
+      ctx.fillText(pad3(Math.round(o.v * 127)), bx + bw + fsz * 0.6, yy + rowH * 0.25);
+      ctx.fillStyle = t - o.t0 < 0.12 ? RED : (o.rel === null ? INK : "rgba(20,20,20,.4)");
+      ctx.fillRect(bx, by, bw * clamp(lv / Math.max(o.v, 0.01), 0, 1), bh);
+    }
+
+    // 03 XY — functional: drag sends CC 1 / CC 2 like the Plinky XY pad
+    tag(px, py - 26, "03 XY   CC1 / CC2");
+    ctx.lineWidth = 2; ctx.strokeStyle = INK; ctx.strokeRect(px, py, ps, ps);
+    ctx.lineWidth = 1; ctx.strokeStyle = "rgba(20,20,20,.18)";
+    ctx.beginPath();
+    for (let q = 1; q < 4; q++) {
+      ctx.moveTo(px + ps * q / 4, py); ctx.lineTo(px + ps * q / 4, py + ps);
+      ctx.moveTo(px, py + ps * q / 4); ctx.lineTo(px + ps, py + ps * q / 4);
+    }
+    ctx.stroke();
+    const cx = px + S.x / 127 * ps, cy = py + (1 - S.y / 127) * ps;
+    const live = xyTouch;
+    ctx.fillStyle = live ? RED : INK;
+    ctx.fillRect(px, cy - 0.5, ps, 1); ctx.fillRect(cx - 0.5, py, 1, ps);
+    if (live) { ctx.fillStyle = "rgba(255,58,31,.25)"; ctx.fillRect(cx - 18, cy - 18, 36, 36); }
+    xBox(cx, cy, 14);
+    ctx.font = "700 13px 'Red Hat Mono', monospace"; ctx.textBaseline = "top"; ctx.fillStyle = INK;
+    ctx.fillText(`X ${pad3(S.x)} · Y ${pad3(S.y)}`, px + 10, py + ps - 24);
+    ctx.fillStyle = t - V.beatT < 0.12 ? RED : INK;
+    ctx.fillRect(px + ps - 22, py + ps - 22, 12, 12);
   },
 };
 
@@ -657,84 +657,14 @@ function tag(x, y, txt) {
   ctx.fillStyle = PAPER; ctx.fillText(txt, x + 6, y + 3);
 }
 function xBox(x, y, r) {
-  ctx.strokeStyle = INK; ctx.lineWidth = 1;
+  ctx.strokeStyle = INK; ctx.lineWidth = 1.5;
   ctx.strokeRect(x - r, y - r, r * 2, r * 2);
   ctx.beginPath(); ctx.moveTo(x - r, y - r); ctx.lineTo(x + r, y + r); ctx.moveTo(x + r, y - r); ctx.lineTo(x - r, y + r); ctx.stroke();
+  ctx.lineWidth = 1;
 }
 
 // ---------------------------------------------------------------------
-// SCENE 02 — BLOOM (dark, additive particles, reverb = trails)
-// ---------------------------------------------------------------------
-const sceneBloom = {
-  name: "BLOOM",
-  parts: [], rings: [], cleared: false,
-  reset() { this.parts = []; this.rings = []; this.cleared = false; },
-  pos(n, v) {
-    const ox = (S.x - 64) / 64 * 0.08, oy = (S.y - 64) / 64 * 0.08;
-    return { x: (pitchX(n) + ox) * W, y: (0.78 - v * 0.5 - oy) * H };
-  },
-  spawn(e) {
-    const p = this.pos(e.n, e.v);
-    const count = Math.round((8 + e.v * 46) * (e.echo ? 0.4 : 1));
-    for (let k = 0; k < count; k++) {
-      const a = Math.random() * Math.PI * 2, sp = rnd(20, 60 + e.v * 260);
-      this.parts.push({ x: p.x, y: p.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, dec: rnd(0.5, 1.4) / (0.4 + releaseTime()), red: Math.random() < 0.35 + pv(2) * 0.5 });
-    }
-    this.rings.push({ x: p.x, y: p.y, t: e.t, v: e.v, echo: e.echo });
-    if (this.parts.length > 2500) this.parts.splice(0, this.parts.length - 2500);
-  },
-  onBeat() { this.beatFlash = 1; },
-  beatFlash: 0,
-  draw(dt) {
-    const t = V.now;
-    // trails: more reverb = longer persistence
-    ctx.globalCompositeOperation = "source-over";
-    ctx.fillStyle = `rgba(10,10,11,${this.cleared ? 0.06 + (1 - pv(14)) * 0.32 : 1})`;
-    ctx.fillRect(0, 0, W, H); this.cleared = true;
-
-    ctx.globalCompositeOperation = "lighter";
-    const jit = Math.max(0, bp(11)) * 120;      // fold -> jitter
-    const size = 1 + pv(1) * 2.6;               // LP cutoff -> particle size
-    for (let i = this.parts.length - 1; i >= 0; i--) {
-      const q = this.parts[i];
-      q.life -= q.dec * dt;
-      if (q.life <= 0) { this.parts.splice(i, 1); continue; }
-      q.vx *= Math.exp(-dt * 1.6); q.vy = q.vy * Math.exp(-dt * 1.6) + 14 * dt;
-      q.x += (q.vx + rnd(-jit, jit)) * dt; q.y += (q.vy + rnd(-jit, jit)) * dt;
-      ctx.fillStyle = q.red ? `rgba(255,58,31,${q.life})` : `rgba(230,230,227,${q.life * 0.8})`;
-      const s = size * (0.5 + q.life);
-      ctx.fillRect(q.x - s / 2, q.y - s / 2, s, s);
-    }
-    // held notes: glowing orbs
-    V.notes.forEach(o => {
-      const lv = V.level(o); if (lv < 0.01) return;
-      const p = this.pos(o.n, o.v), r = 18 + lv * 70 * (0.6 + pv(1));
-      const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
-      g.addColorStop(0, `rgba(255,90,60,${lv * 0.55})`);
-      g.addColorStop(0.4, `rgba(255,58,31,${lv * 0.18})`);
-      g.addColorStop(1, "rgba(255,58,31,0)");
-      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-    });
-    // rings
-    for (let i = this.rings.length - 1; i >= 0; i--) {
-      const g = this.rings[i], a = (t - g.t) / (0.7 + releaseTime() * 0.5);
-      if (a >= 1) { this.rings.splice(i, 1); continue; }
-      ctx.strokeStyle = g.echo ? `rgba(230,230,227,${(1 - a) * 0.3})` : `rgba(255,58,31,${(1 - a) * 0.9})`;
-      ctx.lineWidth = 0.5 + pv(2) * 3 * (1 - a);
-      ctx.beginPath(); ctx.arc(g.x, g.y, 6 + a * (60 + g.v * 220), 0, Math.PI * 2); ctx.stroke();
-    }
-    ctx.globalCompositeOperation = "source-over"; ctx.lineWidth = 1;
-    // beat: thin frame pulse
-    this.beatFlash *= Math.exp(-dt * 8);
-    if (this.beatFlash > 0.02) {
-      ctx.strokeStyle = `rgba(230,230,227,${this.beatFlash * 0.5})`;
-      ctx.strokeRect(10.5, 10.5, W - 21, H - 21);
-    }
-  },
-};
-
-// ---------------------------------------------------------------------
-// SCENE 03 — BARCODE (black/white data, strobe on hard hits)
+// SCENE 02 — BARCODE (black/white data, strobe on hard hits)
 // ---------------------------------------------------------------------
 const sceneBarcode = {
   name: "BARCODE",
@@ -798,7 +728,173 @@ const sceneBarcode = {
   },
 };
 
-const SCENES = [sceneGrid, sceneBloom, sceneBarcode];
+
+
+// ---------------------------------------------------------------------
+// SCENE 03 — FALL (piano-roll waterfall as raw pixel data)
+// ---------------------------------------------------------------------
+const sceneFall = {
+  name: "FALL",
+  oc: null, octx: null, acc: 0, onsets: [],
+  reset() {
+    this.oc = document.createElement("canvas"); this.oc.width = 128; this.oc.height = 200;
+    this.octx = this.oc.getContext("2d"); this.octx.fillStyle = "#000"; this.octx.fillRect(0, 0, 128, 200);
+    this.onsets = []; this.acc = 0;
+  },
+  spawn(e) { this.onsets.push(e); },
+  draw(dt) {
+    if (!this.oc) this.reset();
+    const o = this.octx;
+    const speed = V.bpm ? V.bpm / 60 * 16 : 32;      // one row per 16th note
+    this.acc += dt * speed;
+    let rows = Math.floor(this.acc); this.acc -= rows; rows = Math.min(rows, 20);
+    if (rows > 0) {
+      o.drawImage(this.oc, 0, 0, 128, 200 - rows, 0, rows, 128, 200 - rows);
+      o.fillStyle = "#000"; o.fillRect(0, 0, 128, rows);
+      V.notes.forEach(n => {
+        const lv = V.level(n); if (lv < 0.02) return;
+        o.fillStyle = `rgba(230,230,227,${clamp(lv * 1.3, 0, 1)})`; o.fillRect(n.n, 0, 1, rows);
+      });
+      this.onsets.forEach(ev => { o.fillStyle = ev.echo ? "rgba(230,230,227,.45)" : RED; o.fillRect(ev.n, 0, 1, 1); });
+      this.onsets = [];
+    }
+    const lo = 24, span = 84;                          // C1..B7
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(this.oc, lo, 0, span, 200, 0, 0, W, H);
+    ctx.imageSmoothingEnabled = true;
+    ctx.font = "600 10px 'Red Hat Mono', monospace"; ctx.textBaseline = "top";
+    for (let n = lo; n <= lo + span; n++) {
+      const x = (n - lo) / span * W;
+      if (n % 12 === 0) {
+        ctx.fillStyle = "rgba(230,230,227,.16)"; ctx.fillRect(x, 0, 1, H);
+        ctx.fillStyle = PAPER; ctx.fillText("C" + (n / 12 - 1), x + 4, H - 82);
+      } else { ctx.fillStyle = "rgba(230,230,227,.4)"; ctx.fillRect(x, H - 6, 1, 6); }
+    }
+    readout(PAPER);
+  },
+};
+
+// ---------------------------------------------------------------------
+// SCENE 04 — SCAN (bar-synced sweep, bit-coded pitch lines)
+// ---------------------------------------------------------------------
+const sceneScan = {
+  name: "SCAN",
+  trail: null, tctx: null, cx: 0, flashes: [],
+  reset() {
+    this.trail = document.createElement("canvas");
+    this.trail.width = Math.max(1, Math.round(W)); this.trail.height = Math.max(1, Math.round(H));
+    this.tctx = this.trail.getContext("2d"); this.tctx.fillStyle = "#000"; this.tctx.fillRect(0, 0, W, H);
+    this.flashes = []; this.cx = 0;
+  },
+  py(n) { return (1 - (n - 24) / 84) * H * 0.78 + H * 0.06; },
+  spawn(e) {
+    this.flashes.push({ n: e.n, v: e.v, t: e.t, echo: e.echo });
+    if (this.tctx) {                                   // permanent onset mark in the trail
+      const h = 4 + e.v * 22;
+      this.tctx.fillStyle = e.echo ? "rgba(230,230,227,.5)" : "#fff";
+      this.tctx.fillRect(this.cx - 1, this.py(e.n) - h / 2, e.echo ? 1 : 3, h);
+    }
+  },
+  draw(dt) {
+    if (!this.trail || this.trail.width !== Math.round(W) || this.trail.height !== Math.round(H)) this.reset();
+    const t = V.now, T = this.tctx;
+    const bar = V.bpm ? 240 / V.bpm : 2;               // one screen per bar
+    const prev = this.cx;
+    this.cx = (this.cx + dt / bar * W) % W;
+    T.fillStyle = "rgba(0,0,0,.012)"; T.fillRect(0, 0, W, H);
+    const w = this.cx >= prev ? this.cx - prev + 1 : 2;
+    V.notes.forEach(o => {
+      const lv = V.level(o); if (lv < 0.02) return;
+      T.fillStyle = `rgba(230,230,227,${lv})`; T.fillRect(this.cx - w, this.py(o.n) - 1, w, 2 + lv * 5);
+    });
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(this.trail, 0, 0, W, H);
+    // held notes: horizontal lines, segment pattern = bits of the note number
+    const seg = 10, scroll = t * (V.bpm || 100) * 0.8, off = scroll % seg, k0 = Math.floor(scroll / seg);
+    V.notes.forEach(o => {
+      const lv = V.level(o); if (lv < 0.02) return;
+      const y = this.py(o.n), h = 1 + lv * 6, bits = Math.imul(o.n + 1, 2654435761) >>> 0;
+      ctx.fillStyle = `rgba(230,230,227,${lv * 0.8})`;
+      for (let x = -off, k = k0; x < W; x += seg, k++) if ((bits >>> (k & 31)) & 1) ctx.fillRect(x, y - h / 2, seg - 2, h);
+    });
+    // onsets: full-width flash line + note label at the cursor
+    ctx.font = "700 12px 'Red Hat Mono', monospace"; ctx.textBaseline = "top";
+    for (let i = this.flashes.length - 1; i >= 0; i--) {
+      const f = this.flashes[i], a = (t - f.t) / 0.4;
+      if (a >= 1) { this.flashes.splice(i, 1); continue; }
+      const y = this.py(f.n), h = (1 + f.v * 10) * (1 - a);
+      ctx.fillStyle = f.echo ? `rgba(230,230,227,${(1 - a) * 0.35})` : `rgba(255,255,255,${1 - a})`;
+      ctx.fillRect(0, y - h / 2, W, h);
+      if (!f.echo && a < 0.6) { ctx.fillStyle = RED; ctx.fillText(noteName(f.n), this.cx + 8, y - 18); }
+    }
+    ctx.fillStyle = RED; ctx.fillRect(this.cx, 0, 1, H);
+    ctx.font = "600 10px 'Red Hat Mono', monospace"; ctx.fillStyle = "rgba(230,230,227,.55)";
+    for (let n = 24; n <= 108; n += 12) { const y = this.py(n); ctx.fillRect(0, y, 8, 1); ctx.fillText("C" + (n / 12 - 1), 12, y - 5); }
+    readout(PAPER);
+  },
+};
+
+// ---------------------------------------------------------------------
+// SCENE 05 — HEX (raw MIDI bytes written into a flickering data field)
+// ---------------------------------------------------------------------
+const sceneHex = {
+  name: "HEX",
+  cells: null, w: 0, h: 0, last: null,
+  reset() {
+    this.fs = W > 900 ? 15 : 12; this.cw = this.fs * 1.9; this.chh = this.fs * 1.5;
+    this.cols = Math.max(1, Math.floor((W - 48) / this.cw));
+    this.rows = Math.max(1, Math.floor((H - 190) / this.chh));
+    const n = this.cols * this.rows;
+    this.cells = new Uint8Array(n); this.lum = new Float32Array(n); this.hot = new Float32Array(n);
+    for (let i = 0; i < n; i++) this.cells[i] = (Math.random() * 256) | 0;
+    this.cur = 0; this.w = W; this.h = H;
+  },
+  spawn() {},
+  onRaw(b) {
+    if (!this.cells) return;
+    const n = this.cells.length;
+    b.forEach((x, k) => { const i = this.cur; this.cells[i] = x; this.lum[i] = 1; this.hot[i] = k === 0 ? 1 : 0.6; this.cur = (i + 1) % n; });
+    this.cur = (this.cur + 1) % n;
+    this.last = { b, t: V.now };
+  },
+  draw(dt) {
+    if (!this.cells || this.w !== W || this.h !== H) this.reset();
+    const n = this.cells.length;
+    const flicker = Math.round(3 + Math.max(0, bp(11)) * 60 + pv(2) * 20);
+    for (let k = 0; k < flicker; k++) { const i = (Math.random() * n) | 0; this.cells[i] = (Math.random() * 256) | 0; this.lum[i] = Math.max(this.lum[i], 0.22); }
+    const dl = Math.exp(-dt / (0.3 + releaseTime())), dh = Math.exp(-dt / 0.15);
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+    ctx.font = `600 ${this.fs}px 'Red Hat Mono', monospace`; ctx.textBaseline = "top";
+    const x0 = 24, y0 = 64;
+    for (let i = 0; i < n; i++) {
+      this.lum[i] *= dl; this.hot[i] *= dh;
+      const x = x0 + (i % this.cols) * this.cw, y = y0 + Math.floor(i / this.cols) * this.chh;
+      ctx.fillStyle = this.hot[i] > 0.3 ? RED : `rgba(230,230,227,${0.08 + this.lum[i] * 0.92})`;
+      ctx.fillText(hex2(this.cells[i]), x, y);
+    }
+    // write cursor, blinks on the beat
+    const ci = this.cur;
+    ctx.fillStyle = V.now - V.beatT < 0.12 ? RED : "rgba(230,230,227,.6)";
+    ctx.fillRect(x0 + (ci % this.cols) * this.cw, y0 + Math.floor(ci / this.cols) * this.chh + this.fs + 2, this.fs * 1.3, 2);
+    // last message, big
+    const by = y0 + this.rows * this.chh + 14;
+    if (this.last) {
+      const fresh = V.now - this.last.t < 0.15;
+      const big = Math.min(44, W * 0.045);
+      ctx.fillStyle = fresh ? RED : PAPER;
+      ctx.font = `${big}px Boldonse, 'Arial Black', sans-serif`;
+      ctx.fillText(this.last.b.map(hex2).join(" "), 24, by);
+      ctx.font = "600 12px 'Red Hat Mono', monospace"; ctx.fillStyle = PAPER;
+      ctx.fillText(describe(this.last.b), 24, by + big * 1.5);
+    } else {
+      ctx.font = "600 12px 'Red Hat Mono', monospace"; ctx.fillStyle = PAPER;
+      ctx.fillText("WAITING FOR SIGNAL", 24, by);
+    }
+  },
+};
+
+const SCENES = [sceneEvents, sceneBarcode, sceneFall, sceneScan, sceneHex];
 let cur = 0;
 const scenesEl = document.getElementById("scenes");
 const sceneBtns = SCENES.map((s, k) => {
@@ -808,22 +904,32 @@ const sceneBtns = SCENES.map((s, k) => {
   scenesEl.appendChild(b); return b;
 });
 function setScene(k) {
+  if (SCENES[cur] && SCENES[cur].reset && cur !== k) SCENES[cur].reset();
   cur = k; SCENES[k].reset && SCENES[k].reset();
   sceneBtns.forEach((b, i) => b.classList.toggle("cur", i === k));
 }
 setScene(0);
 
-// Tap on the stage = visual-only note (handy for previews)
+// Stage pointer: scenes may claim it (EVENTS XY pad), otherwise tap = visual-only note
 const tapNotes = new Map();
+function stagePos(e) { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
 cv.addEventListener("pointerdown", e => {
-  const r = cv.getBoundingClientRect();
-  const n = clamp(Math.round(24 + ((e.clientX - r.left) / r.width - 0.06) / 0.88 * 72), 0, 127);
-  const v = clamp(Math.round((1 - (e.clientY - r.top) / r.height) * 127), 20, 127);
+  const [x, y] = stagePos(e), sc = SCENES[cur];
+  cv.setPointerCapture(e.pointerId);
+  if (sc.pointer && sc.pointer("down", e, x, y)) return;
+  const n = clamp(Math.round(24 + (x / W - 0.06) / 0.88 * 72), 0, 127);
+  const v = clamp(Math.round((1 - y / H) * 127), 20, 127);
   tapNotes.set(e.pointerId, n); V.noteOn(n, v, 16);
 });
-const tapEnd = e => { if (tapNotes.has(e.pointerId)) { V.noteOff(tapNotes.get(e.pointerId), 16); tapNotes.delete(e.pointerId); } };
+cv.addEventListener("pointermove", e => { const sc = SCENES[cur]; if (sc.pointer) { const [x, y] = stagePos(e); sc.pointer("move", e, x, y); } });
+const tapEnd = e => {
+  const sc = SCENES[cur];
+  if (sc.pointer) { const [x, y] = stagePos(e); sc.pointer("up", e, x, y); }
+  if (tapNotes.has(e.pointerId)) { V.noteOff(tapNotes.get(e.pointerId), 16); tapNotes.delete(e.pointerId); }
+};
 cv.addEventListener("pointerup", tapEnd);
 cv.addEventListener("pointercancel", tapEnd);
+
 
 // Demo mode: random pentatonic notes + fake clock (visual only, sends nothing)
 let demo = false, demoNext = 0, demoTick = 0;
