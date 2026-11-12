@@ -24,7 +24,7 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; background: var(--ink); overflow: hidden; }
 /* #app covers the whole viewport on top of anything a host page/theme injects */
-#app { --top: calc(env(safe-area-inset-top, 0px) + 28px); /* keeps controls clear of the system edge-gesture zone in fullscreen */
+#app { --top: calc(env(safe-area-inset-top, 0px) + 38px); /* keeps controls clear of the system edge-gesture zone in fullscreen */
   position: fixed; inset: 0; z-index: 2147483000; background: var(--ink); color: var(--paper);
   font-family: var(--mono); font-size: 13px; line-height: 1.2; overflow: hidden; touch-action: none;
   -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
@@ -192,6 +192,11 @@ const PARAMS = [
   { i: 16, n: "VOLUME",   g: "OUT",    init: 100 },
 ];
 const CC_BASE = 16, CC_X = 1, CC_Y = 2;
+// Firmware overrides: param index -> CC (VOLUME / audio-in sidechain moved CC32 -> CC102)
+const CC_OVERRIDE = { 16: 102 };
+const ccOf = i => CC_OVERRIDE[i] ?? CC_BASE + i;
+const iOfCC = cc => { for (const k in CC_OVERRIDE) if (CC_OVERRIDE[k] === cc) return +k;
+  const i = cc - CC_BASE; return (i >= 0 && i < 22 && CC_OVERRIDE[i] === undefined) ? i : -1; };
 const STORE_KEY = "plinkyCompanion.v1";
 
 // =====================================================================
@@ -304,8 +309,8 @@ function onMidi(e) {
     V.raw([st, d[1], d[2]]);
     if (ch !== S.chan) return;
     const cc = d[1], v = d[2];
-    if (cc >= CC_BASE && cc < CC_BASE + 22) {
-      const i = cc - CC_BASE;
+    const i = iOfCC(cc);
+    if (i >= 0) {
       if (!S.touching.has(i)) { S.vals[i] = v; renderFader(i); }
     } else if (cc === CC_X && !xyTouch) { S.x = v; renderXY(); }
     else if (cc === CC_Y && !xyTouch) { S.y = v; renderXY(); }
@@ -381,7 +386,7 @@ function attachFader(p, track) {
 function setParam(i, v) {
   v = Math.max(0, Math.min(127, v | 0));
   if (S.vals[i] === v) return;
-  S.vals[i] = v; renderFader(i); queueCC(CC_BASE + i, v);
+  S.vals[i] = v; renderFader(i); queueCC(ccOf(i), v);
   markDirty();
 }
 
@@ -438,7 +443,7 @@ function renderPresets() {
 }
 function markDirty() { if (S.curPreset >= 0) { S.curPreset = -1; renderPresets(); } }
 function sendAll() {
-  PARAMS.forEach(p => queueCC(CC_BASE + p.i, S.vals[p.i]));
+  PARAMS.forEach(p => queueCC(ccOf(p.i), S.vals[p.i]));
   queueCC(CC_X, S.x); queueCC(CC_Y, S.y);
 }
 bSave.onclick = () => { S.saveArmed = !S.saveArmed; renderPresets(); };
