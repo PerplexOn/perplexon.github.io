@@ -192,11 +192,8 @@ const PARAMS = [
   { i: 16, n: "VOLUME",   g: "OUT",    init: 100 },
 ];
 const CC_BASE = 16, CC_X = 1, CC_Y = 2;
-// Firmware overrides: param index -> CC (VOLUME / audio-in sidechain moved CC32 -> CC102)
-const CC_OVERRIDE = { 16: 102 };
-const ccOf = i => CC_OVERRIDE[i] ?? CC_BASE + i;
-const iOfCC = cc => { for (const k in CC_OVERRIDE) if (CC_OVERRIDE[k] === cc) return +k;
-  const i = cc - CC_BASE; return (i >= 0 && i < 22 && CC_OVERRIDE[i] === undefined) ? i : -1; };
+const ccOf = i => i === 16 ? 102 : CC_BASE + i;   // VOLUME = CC102 (firmware), rest = 16 + index
+const iOfCC = cc => cc === 102 ? 16 : (cc >= CC_BASE && cc < CC_BASE + 22 && cc !== CC_BASE + 16) ? cc - CC_BASE : -1;
 const STORE_KEY = "plinkyCompanion.v1";
 
 // =====================================================================
